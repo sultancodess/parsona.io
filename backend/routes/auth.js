@@ -1,10 +1,12 @@
 const express = require('express')
 const jwt = require('jsonwebtoken')
 const axios = require('axios')
+const crypto = require('crypto')
 const { body, validationResult } = require('express-validator')
 const User = require('../models/User')
 const Role = require('../models/Role')
 const auth = require('../middleware/auth')
+const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService')
 
 const router = express.Router()
 
@@ -12,6 +14,13 @@ const router = express.Router()
 const generateToken = (userId) => {
   return jwt.sign({ userId }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN || '7d'
+  })
+}
+
+// Generate refresh token
+const generateRefreshToken = (userId) => {
+  return jwt.sign({ userId }, process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET, {
+    expiresIn: '30d'
   })
 }
 
@@ -51,12 +60,27 @@ router.post('/signup', [
 
     await user.save()
 
-    // Generate token
+    // Generate tokens
     const token = generateToken(user._id)
+    const refreshToken = generateRefreshToken(user._id)
+
+    // Generate email verification token
+    const verificationToken = crypto.randomBytes(32).toString('hex')
+    user.emailVerificationToken = crypto.createHash('sha256').update(verificationToken).digest('hex')
+    user.emailVerificationExpires = Date.now() + 24 * 60 * 60 * 1000 // 24 hours
+    await user.save()
+
+    // Send verification email
+    try {
+      await sendVerificationEmail(user.email, user.name, verificationToken)
+    } catch (error) {
+      console.error('Failed to send verification email:', error)
+    }
 
     res.status(201).json({
-      message: 'User created successfully',
+      message: 'User created successfully. Please check your email to verify your account.',
       token,
+      refreshToken,
       user: user.toJSON()
     })
   } catch (error) {
@@ -105,12 +129,14 @@ router.post('/login', [
     user.lastLoginAt = new Date()
     await user.save()
 
-    // Generate token
+    // Generate tokens
     const token = generateToken(user._id)
+    const refreshToken = generateRefreshToken(user._id)
 
     res.json({
       message: 'Login successful',
       token,
+      refreshToken,
       user: user.toJSON()
     })
   } catch (error) {
@@ -145,20 +171,42 @@ router.get('/me', auth, async (req, res) => {
 })
 
 // @route   POST /api/auth/refresh
-// @desc    Refresh JWT token
-// @access  Private
-router.post('/refresh', auth, async (req, res) => {
+// @desc    Refresh JWT token using refresh token
+// @access  Public
+router.post('/refresh', async (req, res) => {
   try {
-    const token = generateToken(req.user.id)
+    const { refreshToken } = req.body
+
+    if (!refreshToken) {
+      return res.status(401).json({
+        message: 'Refresh token is required'
+      })
+    }
+
+    // Verify refresh token
+    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET)
+    
+    // Get user
+    const user = await User.findById(decoded.userId)
+    if (!user || !user.isActive) {
+      return res.status(401).json({
+        message: 'Invalid refresh token'
+      })
+    }
+
+    // Generate new tokens
+    const newToken = generateToken(user._id)
+    const newRefreshToken = generateRefreshToken(user._id)
     
     res.json({
-      token,
+      token: newToken,
+      refreshToken: newRefreshToken,
       message: 'Token refreshed successfully'
     })
   } catch (error) {
     console.error('Token refresh error:', error)
-    res.status(500).json({
-      message: 'Server error during token refresh'
+    res.status(401).json({
+      message: 'Invalid or expired refresh token'
     })
   }
 })
@@ -170,6 +218,336 @@ router.post('/logout', auth, (req, res) => {
   res.json({
     message: 'Logout successful'
   })
+})
+
+// @route   GET /api/auth/verify-email/:token
+// @desc    Verify user email
+// @access  Public
+router.get('/verify-email/:token', async (req, res) => {
+  try {
+    const hashedToken = crypto.createHash('sha256').update(req.params.token).digest('hex')
+
+    const user = await User.findOne({
+      emailVerificationToken: hashedToken,
+      emailVerificationExpires: { $gt: Date.now() }
+    })
+
+    if (!user) {
+      return res.status(400).json({
+        message: 'Invalid or expired verification token'
+      })
+    }
+
+    user.emailVerified = true
+    user.emailVerificationToken = undefined
+    user.emailVerificationExpires = undefined
+    await user.save()
+
+    res.json({
+      message: 'Email verified successfully',
+      user: user.toJSON()
+    })
+  } catch (error) {
+    console.error('Email verification error:', error)
+    res.status(500).json({
+      message: 'Server error during email verification'
+    })
+  }
+})
+
+// @route   POST /api/auth/resend-verification
+// @desc    Resend verification email
+// @access  Private
+router.post('/resend-verification', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id)
+
+    if (user.emailVerified) {
+      return res.status(400).json({
+        message: 'Email is already verified'
+      })
+    }
+
+    // Generate new verification token
+    const verificationToken = crypto.randomBytes(32).toString('hex')
+    user.emailVerificationToken = crypto.createHash('sha256').update(verificationToken).digest('hex')
+    user.emailVerificationExpires = Date.now() + 24 * 60 * 60 * 1000
+    await user.save()
+
+    // Send verification email
+    await sendVerificationEmail(user.email, user.name, verificationToken)
+
+    res.json({
+      message: 'Verification email sent successfully'
+    })
+  } catch (error) {
+    console.error('Resend verification error:', error)
+    res.status(500).json({
+      message: 'Server error sending verification email'
+    })
+  }
+})
+
+// @route   POST /api/auth/forgot-password
+// @desc    Request password reset
+// @access  Public
+router.post('/forgot-password', [
+  body('email').isEmail().normalizeEmail().withMessage('Please provide a valid email')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      })
+    }
+
+    const { email } = req.body
+    const user = await User.findOne({ email })
+
+    // Always return success to prevent email enumeration
+    if (!user) {
+      return res.json({
+        message: 'If an account exists with this email, a password reset link has been sent'
+      })
+    }
+
+    // Generate reset token
+    const resetToken = crypto.randomBytes(32).toString('hex')
+    user.passwordResetToken = crypto.createHash('sha256').update(resetToken).digest('hex')
+    user.passwordResetExpires = Date.now() + 60 * 60 * 1000 // 1 hour
+    await user.save()
+
+    // Send reset email
+    try {
+      await sendPasswordResetEmail(user.email, user.name, resetToken)
+    } catch (error) {
+      console.error('Failed to send password reset email:', error)
+      user.passwordResetToken = undefined
+      user.passwordResetExpires = undefined
+      await user.save()
+      
+      return res.status(500).json({
+        message: 'Error sending password reset email'
+      })
+    }
+
+    res.json({
+      message: 'If an account exists with this email, a password reset link has been sent'
+    })
+  } catch (error) {
+    console.error('Forgot password error:', error)
+    res.status(500).json({
+      message: 'Server error processing password reset request'
+    })
+  }
+})
+
+// @route   POST /api/auth/reset-password/:token
+// @desc    Reset password with token
+// @access  Public
+router.post('/reset-password/:token', [
+  body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      })
+    }
+
+    const hashedToken = crypto.createHash('sha256').update(req.params.token).digest('hex')
+
+    const user = await User.findOne({
+      passwordResetToken: hashedToken,
+      passwordResetExpires: { $gt: Date.now() }
+    })
+
+    if (!user) {
+      return res.status(400).json({
+        message: 'Invalid or expired reset token'
+      })
+    }
+
+    // Set new password
+    user.password = req.body.password
+    user.passwordResetToken = undefined
+    user.passwordResetExpires = undefined
+    user.passwordChangedAt = Date.now()
+    await user.save()
+
+    // Generate new tokens
+    const token = generateToken(user._id)
+    const refreshToken = generateRefreshToken(user._id)
+
+    res.json({
+      message: 'Password reset successful',
+      token,
+      refreshToken,
+      user: user.toJSON()
+    })
+  } catch (error) {
+    console.error('Reset password error:', error)
+    res.status(500).json({
+      message: 'Server error resetting password'
+    })
+  }
+})
+
+// @route   POST /api/auth/change-password
+// @desc    Change password (when logged in)
+// @access  Private
+router.post('/change-password', auth, [
+  body('currentPassword').exists().withMessage('Current password is required'),
+  body('newPassword').isLength({ min: 8 }).withMessage('New password must be at least 8 characters')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      })
+    }
+
+    const { currentPassword, newPassword } = req.body
+    const user = await User.findById(req.user._id)
+
+    // Verify current password
+    const isMatch = await user.comparePassword(currentPassword)
+    if (!isMatch) {
+      return res.status(401).json({
+        message: 'Current password is incorrect'
+      })
+    }
+
+    // Set new password
+    user.password = newPassword
+    user.passwordChangedAt = Date.now()
+    await user.save()
+
+    // Generate new tokens
+    const token = generateToken(user._id)
+    const refreshToken = generateRefreshToken(user._id)
+
+    res.json({
+      message: 'Password changed successfully',
+      token,
+      refreshToken
+    })
+  } catch (error) {
+    console.error('Change password error:', error)
+    res.status(500).json({
+      message: 'Server error changing password'
+    })
+  }
+})
+
+// @route   PUT /api/auth/update-profile
+// @desc    Update user profile
+// @access  Private
+router.put('/update-profile', auth, [
+  body('name').optional().trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
+  body('email').optional().isEmail().normalizeEmail().withMessage('Please provide a valid email')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      })
+    }
+
+    const { name, email, avatar } = req.body
+    const user = await User.findById(req.user._id)
+
+    // Check if email is being changed and if it's already taken
+    if (email && email !== user.email) {
+      const existingUser = await User.findOne({ email })
+      if (existingUser) {
+        return res.status(400).json({
+          message: 'Email is already in use'
+        })
+      }
+      user.email = email
+      user.emailVerified = false // Require re-verification
+      
+      // Generate verification token
+      const verificationToken = crypto.randomBytes(32).toString('hex')
+      user.emailVerificationToken = crypto.createHash('sha256').update(verificationToken).digest('hex')
+      user.emailVerificationExpires = Date.now() + 24 * 60 * 60 * 1000
+      
+      try {
+        await sendVerificationEmail(email, name || user.name, verificationToken)
+      } catch (error) {
+        console.error('Failed to send verification email:', error)
+      }
+    }
+
+    if (name) user.name = name
+    if (avatar) user.avatar = avatar
+
+    await user.save()
+
+    res.json({
+      message: 'Profile updated successfully',
+      user: user.toJSON()
+    })
+  } catch (error) {
+    console.error('Update profile error:', error)
+    res.status(500).json({
+      message: 'Server error updating profile'
+    })
+  }
+})
+
+// @route   DELETE /api/auth/delete-account
+// @desc    Delete user account
+// @access  Private
+router.delete('/delete-account', auth, [
+  body('password').exists().withMessage('Password is required to delete account')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req)
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      })
+    }
+
+    const user = await User.findById(req.user._id)
+
+    // Verify password
+    if (user.password) {
+      const isMatch = await user.comparePassword(req.body.password)
+      if (!isMatch) {
+        return res.status(401).json({
+          message: 'Incorrect password'
+        })
+      }
+    }
+
+    // Soft delete - deactivate account
+    user.isActive = false
+    user.deletedAt = Date.now()
+    await user.save()
+
+    // Could also delete related data here (posts, roles, etc.)
+
+    res.json({
+      message: 'Account deleted successfully'
+    })
+  } catch (error) {
+    console.error('Delete account error:', error)
+    res.status(500).json({
+      message: 'Server error deleting account'
+    })
+  }
 })
 
 // @route   GET /api/auth/google
